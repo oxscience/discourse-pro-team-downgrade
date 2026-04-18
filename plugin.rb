@@ -2,49 +2,75 @@
 
 # name: discourse-pro-team-downgrade
 # about: Downgrades trust level when user leaves all Pro Team groups
-# version: 1.0.0
+# version: 1.0.1
 # authors: OX Science
 # url: https://github.com/oxscience/discourse-pro-team-downgrade
 
-after_initialize do
-  PRO_USER_GROUP_NAME = "Pro-User"
-  PRO_TEAMS_CATEGORY_ID = 16  # "Pro Teams" parent category
-  DOWNGRADE_TO_TRUST_LEVEL = 1
-  STAFF_GROUP_ID = 3  # "Team" group — not a customer group
+PRO_USER_GROUP_NAME = "Pro-User"
+PRO_TEAMS_CATEGORY_ID = 16       # "Pro Teams" parent category
+DOWNGRADE_TO_TRUST_LEVEL = 1     # Target TL after losing Pro status
+STAFF_GROUP_ID = 3               # "Team" group — not a customer group
 
-  # When a user is removed from a Pro-granting group, check if they are
-  # still in any other Pro-granting group. If not, downgrade their TL.
+module ::ProTeamDowngrade
+  def self.still_has_pro_status?(user_id)
+    sub_cat_ids = Category.where(parent_category_id: PRO_TEAMS_CATEGORY_ID).pluck(:id)
+    pro_group_ids = CategoryGroup.where(category_id: sub_cat_ids).pluck(:group_id).uniq
+    if (pro_user = Group.find_by(name: PRO_USER_GROUP_NAME))
+      pro_group_ids << pro_user.id
+    end
+    pro_group_ids -= [STAFF_GROUP_ID]
+    GroupUser.where(user_id: user_id, group_id: pro_group_ids).exists?
+  end
+
+  def self.was_pro_group?(group)
+    return true if group.name == PRO_USER_GROUP_NAME
+    sub_cat_ids = Category.where(parent_category_id: PRO_TEAMS_CATEGORY_ID).pluck(:id)
+    CategoryGroup.where(group_id: group.id, category_id: sub_cat_ids).exists?
+  end
+end
+
+module ::Jobs
+  class ProTeamEnforceDowngrade < ::Jobs::Base
+    def execute(args)
+      user = User.find_by(id: args[:user_id])
+      return unless user
+      return if user.staff?
+      return if ::ProTeamDowngrade.still_has_pro_status?(user.id)
+      return if user.trust_level == DOWNGRADE_TO_TRUST_LEVEL
+
+      old_tl = user.trust_level
+      TrustLevel.change_user_to_level!(user, DOWNGRADE_TO_TRUST_LEVEL) if defined?(TrustLevel.change_user_to_level!)
+      # Fallback: direct update bypassing Discourse's auto-downgrade
+      user.update_columns(trust_level: DOWNGRADE_TO_TRUST_LEVEL)
+      user.reload
+
+      Rails.logger.info(
+        "[pro-team-downgrade] #{user.username}: TL#{old_tl} -> TL#{user.trust_level} " \
+          "(trigger: #{args[:trigger_group_name]})"
+      )
+    rescue => e
+      Rails.logger.error("[pro-team-downgrade] Job error: #{e.message}")
+    end
+  end
+end
+
+after_initialize do
   DiscourseEvent.on(:user_removed_from_group) do |user, group|
     begin
-      # Skip staff/admins — their TL is tied to their role
       next if user.staff?
+      next unless ::ProTeamDowngrade.was_pro_group?(group)
+      next if ::ProTeamDowngrade.still_has_pro_status?(user.id)
 
-      # Was the group the user left a Pro-granting group?
-      sub_cat_ids = Category.where(parent_category_id: PRO_TEAMS_CATEGORY_ID).pluck(:id)
-      was_pro_team = CategoryGroup.where(group_id: group.id, category_id: sub_cat_ids).exists?
-      pro_user_group = Group.find_by(name: PRO_USER_GROUP_NAME)
-      was_pro_user = pro_user_group && group.id == pro_user_group.id
-
-      next unless was_pro_team || was_pro_user
-
-      # Collect all Pro-granting group IDs (customer-facing only)
-      pro_group_ids = CategoryGroup.where(category_id: sub_cat_ids).pluck(:group_id).uniq
-      pro_group_ids << pro_user_group.id if pro_user_group
-      pro_group_ids -= [STAFF_GROUP_ID]
-
-      # Is the user still in at least one Pro-granting group?
-      still_pro = GroupUser.where(user_id: user.id, group_id: pro_group_ids).exists?
-
-      if !still_pro && user.trust_level > DOWNGRADE_TO_TRUST_LEVEL
-        old_tl = user.trust_level
-        user.change_trust_level!(DOWNGRADE_TO_TRUST_LEVEL)
-        Rails.logger.info(
-          "[pro-team-downgrade] #{user.username}: TL#{old_tl} -> TL#{DOWNGRADE_TO_TRUST_LEVEL} " \
-            "(removed from #{group.name}, no other Pro-groups)"
-        )
-      end
+      # Defer by 5s so Discourse's own auto-downgrade (which sets TL to 0)
+      # runs first. Then our job enforces the target TL.
+      Jobs.enqueue_in(
+        5.seconds,
+        :pro_team_enforce_downgrade,
+        user_id: user.id,
+        trigger_group_name: group.name
+      )
     rescue => e
-      Rails.logger.error("[pro-team-downgrade] Error for #{user&.username}: #{e.message}")
+      Rails.logger.error("[pro-team-downgrade] Event error: #{e.message}")
     end
   end
 end
