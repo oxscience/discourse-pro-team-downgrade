@@ -13,6 +13,17 @@ DOWNGRADE_TO_TRUST_LEVEL = 1
 STAFF_GROUP_ID = 3
 
 after_initialize do
+  # Cache whether a group was "Pro" BEFORE destroy, so we can still check in
+  # the group_destroyed event (by then CategoryGroup rows are gone).
+  ::Group.class_eval do
+    before_destroy :cache_pro_team_status_for_plugin, prepend: true
+
+    def cache_pro_team_status_for_plugin
+      @cached_pro_team_status = ::ProTeamDowngrade.is_pro_group?(self)
+      true
+    end
+  end
+
   module ::ProTeamDowngrade
     # A group is "Pro" if it has permissions on at least one Pro Teams subcategory
     # or if it is the Pro-User group itself. Staff group is excluded.
@@ -94,6 +105,34 @@ after_initialize do
       )
     rescue => e
       Rails.logger.error("[pro-team-downgrade] Event error: #{e.message}")
+    end
+  end
+
+  # GROUP DELETE: when an entire Pro group is destroyed, Discourse fires
+  # :group_destroyed with the list of former member IDs (but does NOT fire
+  # :user_removed_from_group). Handle that case here.
+  DiscourseEvent.on(:group_destroyed) do |group, user_ids|
+    begin
+      # CategoryGroup rows are already gone here, so we rely on the
+      # before_destroy cache set above.
+      was_pro = group.instance_variable_get(:@cached_pro_team_status)
+      next unless was_pro
+      next unless user_ids.present?
+
+      user_ids.each do |uid|
+        Jobs.enqueue_in(
+          5.seconds,
+          :pro_team_enforce_downgrade,
+          user_id: uid,
+          trigger_group_name: "#{group.name} (destroyed)"
+        )
+      end
+      Rails.logger.info(
+        "[pro-team-downgrade] Enqueued downgrade check for #{user_ids.size} users " \
+          "(group #{group.name} was destroyed)"
+      )
+    rescue => e
+      Rails.logger.error("[pro-team-downgrade] group_destroyed error: #{e.message}")
     end
   end
 end
